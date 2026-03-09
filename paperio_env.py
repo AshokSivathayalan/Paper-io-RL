@@ -5,6 +5,8 @@ import pygame
 from gymnasium import spaces
 from pettingzoo import ParallelEnv
 from collections import deque
+from typing import Optional
+import functools
 
 # Directions
 UP, DOWN, LEFT, RIGHT = 0, 1, 2, 3
@@ -33,47 +35,78 @@ class PaperIOEnv(ParallelEnv):
     
     metadata = {"render_modes": ["human", "rgb_array"]}
 
-    def __init__(self, grid_size=20, view_size=11, reward_type=1, render_mode = None, max_steps=500):
-        super().__init__()
+    # Number of pixels per grid cell in the Pygame window
+    _CELL_PX = 22
 
-        self.grid_size = grid_size
-        self.view_size = view_size
-        self.reward_mode = reward_type
+    # Colours
+    _PALETTE: dict[int, tuple[int, int, int]] = {
+        NEUTRAL:      (210, 210, 210),
+        P0_TERRITORY: (100, 149, 237), #light blue
+        P1_TERRITORY: (255,  99,  71), # light red
+        P0_TRAIL:     ( 20,  60, 220), # deep blue
+        P1_TRAIL:     (200,  30,  30), # deep red
+    }
+    _HEAD_COLOR: dict[str, tuple[int, int, int]] = {
+        "player_0": (  0,   0, 180),
+        "player_1": (180,   0,   0),
+    }
+
+    def __init__(self,
+        grid_size: int = 20,
+        reward_mode: str = "mixed",
+        render_mode: Optional[str] = None,
+        max_steps: int = 1000,
+    ):
+        super().__init__()
+        assert reward_mode in ("sparse", "dense", "mixed"), (
+            "reward_mode must be 'sparse', 'dense', or 'mixed'"
+        )
+        assert render_mode in (None, "human", "rgb_array")
+
+        self.grid_size = grid_size # probably keep at 20
+        self.reward_mode = reward_mode
         self.render_mode = render_mode
         self.max_steps = max_steps
 
         self.possible_agents: list[str] = AGENT_IDS[:]
         self.agents: list[str] = []
 
-        # observations for agent
-        _obs_shape = (view_size, view_size, 5)
+        _obs_shape = (grid_size, grid_size, 7)
         self.observation_spaces = {
             a: spaces.Box(0.0, 1.0, shape=_obs_shape, dtype=np.float32)
             for a in self.possible_agents
         }
-
-        # actions for agent
         self.action_spaces = {
             a: spaces.Discrete(4) for a in self.possible_agents
         }
 
-        # runtime info
+        # rendering
+        self._screen: Optional[pygame.Surface] = None
+        self._clock: Optional[pygame.time.Clock] = None
+
+        # state info
         self.grid: np.ndarray = np.empty(0)
         self.pos: dict[str, list[int]] = {}
         self.direction: dict[str, int] = {}
         self.alive: dict[str, bool] = {}
         self.has_trail: dict[str, bool] = {}
-        self.step_count = 0
+        self.step_count: int = 0
 
-    def reset(
-        self,
-        seed = None,
-        options = None,
+    @functools.lru_cache(maxsize=None)
+    def observation_space(self, agent: str) -> spaces.Space:
+        return self.observation_spaces[agent]
+
+    @functools.lru_cache(maxsize=None)
+    def action_space(self, agent: str) -> spaces.Space:
+        return self.action_spaces[agent]
+
+    def reset(self,
+        seed: Optional[int] = None,
+        options: Optional[dict] = None,
     ):
         if seed is not None:
             np.random.seed(seed)
 
-        # resetting state info
         self.agents = self.possible_agents[:]
         self.step_count = 0
         self.grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
@@ -85,7 +118,7 @@ class PaperIOEnv(ParallelEnv):
 
         # Each player spawns in an opposite corner with a small territory block
         init_half = 2
-        margin = init_half + 1 # distance from grid edge to spawn centre
+        margin = init_half + 1
 
         spawn_cfg = {
             "player_0": (margin, margin, RIGHT, P0_TERRITORY),
@@ -100,7 +133,7 @@ class PaperIOEnv(ParallelEnv):
             self.alive[agent] = True
             self.has_trail[agent] = False
 
-            # Stamp initial territory block
+            # Initial territory
             for dr in range(-init_half, init_half + 1):
                 for dc in range(-init_half, init_half + 1):
                     nr, nc = r0 + dr, c0 + dc
@@ -108,33 +141,34 @@ class PaperIOEnv(ParallelEnv):
                         self.grid[nr, nc] = tv
 
         observations = {a: self._obs(a) for a in self.agents}
-        info = {a: {} for a in self.agents}
+        info: dict[str, dict] = {a: {} for a in self.agents}
         return observations, info
 
-    def _obs(self, agent):
-
+    def _obs(self, agent: str) -> np.ndarray:
+        # return array representing grid_state
         idx = AGENT_IDX[agent]
-        r, c = self.pos[agent]
-        L = self.local_view_size
-        half = L // 2
+        opp = AGENT_IDS[1 - idx]
         G = self.grid_size
 
-        # Pad with neutral so agents see out=of-bounds area as neutral
-        padded = np.full((G + 2 * half, G + 2 * half), NEUTRAL, dtype=np.int8)
-        padded[half: half + G, half: half + G] = self.grid
+        obs = np.zeros((G, G, 7), dtype=np.float32)
+        obs[:, :, 0] = (self.grid == TERRITORY[idx]).astype(np.float32)
+        obs[:, :, 1] = (self.grid == TERRITORY[1 - idx]).astype(np.float32)
+        obs[:, :, 2] = (self.grid == TRAIL[idx]).astype(np.float32)
+        obs[:, :, 3] = (self.grid == TRAIL[1 - idx]).astype(np.float32)
 
-        # generate observation
-        local = padded[r: r + L, c: c + L]
-        obs = np.zeros((L, L, 5), dtype=np.float32)
-        obs[:, :, 0] = (local == TERRITORY[idx]).astype(np.float32)
-        obs[:, :, 1] = (local == TERRITORY[1 - idx]).astype(np.float32)
-        obs[:, :, 2] = (local == TRAIL[idx]).astype(np.float32)
-        obs[:, :, 3] = (local == TRAIL[1 - idx]).astype(np.float32)
-        obs[:, :, 4] = self.direction[agent] / 3.0
+        r, c = self.pos[agent]
+        obs[r, c, 4] = 1.0
+
+        if self.alive.get(opp, False):
+            or_, oc = self.pos[opp]
+            obs[or_, oc, 5] = 1.0
+
+        obs[:, :, 6] = self.direction[agent] / 3.0
         return obs
 
-    def step(self, actions):
-
+    def step(self,
+             actions: dict[str, int]
+    ):
         self.step_count += 1
 
         prev_terr = {
@@ -142,139 +176,36 @@ class PaperIOEnv(ParallelEnv):
             for a in self.agents
         }
 
-        rewards = {a: 0.0 for a in self.agents}
-        terminations = {a: False for a in self.agents}
-        truncations = {a: False for a in self.agents}
-        infos = {a: {} for a in self.agents}
+        terminations: dict[str, bool] = {a: False for a in self.agents}
+        truncations: dict[str, bool] = {a: False for a in self.agents}
+        infos: dict[str, dict] = {a: {} for a in self.agents}
 
-        # New agent positions
-        new_pos: dict[str, list[int]] = {}
-        for agent in self.agents:
-            action = int(actions.get(agent, self.direction[agent]))
-            self.direction[agent] = action
-            r, c = self.pos[agent]
-            dr, dc = DR[action]
-            new_pos[agent] = [r + dr, c + dc]
+        moved = self._apply_actions(actions)
 
-        # Agent moves
-        # check for trail collisions against the cell they already occupy
-        killed: set[str] = set()
-        moved: set[str] = set()
-        for agent in self.agents:
-            nr, nc = new_pos[agent]
-            if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size:
-                self.pos[agent] = new_pos[agent]
-                moved.add(agent)
-            # otherwise agent stays put; skip trail/collision check for this step
+        # Collect trail-collision kills
+        killed = self._detect_trail_kills(moved)
+        self._apply_kills(killed, terminations)
 
-        # Detect trail collision for agents that moved
-        # Collect all kills before applying any so both can detect each other
-        trail_kills: set[str] = set()
-        for agent in moved:
-            idx = AGENT_IDX[agent]
-            r, c = self.pos[agent]
-            cell = int(self.grid[r, c])
-            if cell == TRAIL[1 - idx]: # stepped on opponent's trail
-                trail_kills.add(AGENT_IDS[1 - idx])
-            elif cell == TRAIL[idx]: # stepped on own trail
-                trail_kills.add(agent)
-        killed |= trail_kills
+        # Trail extension / territory closure; may produce enclosure kills
+        enclosure_kills = self._update_trails_and_territory(killed)
+        new_kills = enclosure_kills - killed
+        self._apply_kills(new_kills, terminations)
+        killed |= new_kills
 
-        # Death handling
-        if killed:
-            for agent in killed:
-                self.alive[agent] = False
-                idx = AGENT_IDX[agent]
-                self.grid[self.grid == TRAIL[idx]] = NEUTRAL
-                self.has_trail[agent] = False
-            # Any death ends episode
-            for a in self.agents:
-                terminations[a] = True
+        rewards = {
+            a: self._compute_reward(a, prev_terr, killed)
+            for a in self.agents
+        }
 
-        # Update trails and owned cells
-        enclosure_kills: set[str] = set()
-        for agent in self.agents:
-            if agent in killed:
-                continue
-            idx = AGENT_IDX[agent]
-            r, c = self.pos[agent]
-            cell = int(self.grid[r, c])
-            tv = TERRITORY[idx]
-            tr = TRAIL[idx]
-
-            if cell == tv:
-                # Agent returned to its own territory → close trail
-                if self.has_trail[agent]:
-                    opp_caught = self._flood_claim(idx)
-                    if opp_caught:
-                        enclosure_kills.add(AGENT_IDS[1 - idx])
-                    self.has_trail[agent] = False
-            else:
-                # Agent is outside territory → leave trail
-                if cell != tr:
-                    self.grid[r, c] = tr
-                self.has_trail[agent] = True
-
-        # Handle opponents killed by enclosure
-        for agent in enclosure_kills:
-            if agent not in killed:
-                killed.add(agent)
-                self.alive[agent] = False
-                idx = AGENT_IDX[agent]
-                self.grid[self.grid == TRAIL[idx]] = NEUTRAL
-                self.has_trail[agent] = False
-                for a in self.agents:
-                    terminations[a] = True
-
-        # Calculate reward
-        grid_area = self.grid_size ** 2
-        for agent in self.agents:
-            idx = AGENT_IDX[agent]
-            opp = AGENT_IDS[1 - idx]
-            won = agent not in killed and opp in killed
-            lost = agent in killed
-
-            if self.reward_mode == "sparse":
-                if won:
-                    rewards[agent] = 1.0
-                elif lost:
-                    rewards[agent] = -1.0
-
-            elif self.reward_mode == "dense":
-                curr = int(np.sum(self.grid == TERRITORY[idx]))
-                opp_curr = int(np.sum(self.grid == TERRITORY[1 - idx]))
-                delta = (curr - prev_terr[agent]) / grid_area
-                opp_delta = (opp_curr - prev_terr[opp]) / grid_area
-                rewards[agent] = delta - 0.5 * opp_delta
-                if won:
-                    rewards[agent] += 1.0
-                elif lost:
-                    rewards[agent] -= 1.0
-
-            else:  # "mixed"
-                curr = int(np.sum(self.grid == TERRITORY[idx]))
-                delta = (curr - prev_terr[agent]) / grid_area
-                survival = 0.0 if lost else 0.005
-                rewards[agent] = delta + survival
-                if won:
-                    rewards[agent] += 1.0
-                elif lost:
-                    rewards[agent] -= 1.0
-        # truncation
         if self.step_count >= self.max_steps:
             for a in self.agents:
                 truncations[a] = True
 
-        # return observations
-        _zero_obs = np.zeros(
-            (self.local_view_size, self.local_view_size, 5), dtype=np.float32
-        )
-        observations: dict[str, np.ndarray] = {}
-        for a in self.agents:
-            observations[a] = (
-                _zero_obs if (terminations[a] or truncations[a])
-                else self._obs(a)
-            )
+        _zero_obs = np.zeros((self.grid_size, self.grid_size, 7), dtype=np.float32)
+        observations = {
+            a: _zero_obs if (terminations[a] or truncations[a]) else self._obs(a)
+            for a in self.agents
+        }
 
         self.agents = [
             a for a in self.agents
@@ -282,10 +213,109 @@ class PaperIOEnv(ParallelEnv):
         ]
 
         return observations, rewards, terminations, truncations, infos
+
+    # update directions and move agents
+    def _apply_actions(self, actions: dict[str, int]):
+        moved: set[str] = set()
+        for agent in self.agents:
+            action = int(actions.get(agent, self.direction[agent]))
+            self.direction[agent] = action
+            r, c = self.pos[agent]
+            dr, dc = DR[action]
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size:
+                self.pos[agent] = [nr, nc]
+                moved.add(agent)
+        return moved
+
+    # check for trail collision (which kills agent)s
+    def _detect_trail_kills(self, moved: set[str]):
+        kills: set[str] = set()
+        for agent in moved:
+            idx = AGENT_IDX[agent]
+            r, c = self.pos[agent]
+            cell = int(self.grid[r, c])
+            if cell == TRAIL[1 - idx]:    # stepped on opponent's trail
+                kills.add(AGENT_IDS[1 - idx])
+            elif cell == TRAIL[idx]:       # stepped on own trail
+                kills.add(agent)
+        return kills
+
+    # erase killed agent trail, end game if kill occurs
+    def _apply_kills(self, killed: set[str], terminations: dict[str, bool]):
+        for agent in killed:
+            self.alive[agent] = False
+            idx = AGENT_IDX[agent]
+            self.grid[self.grid == TRAIL[idx]] = NEUTRAL
+            self.has_trail[agent] = False
+        if killed:
+            for a in self.agents:
+                terminations[a] = True
+
+    
+    # close or extend trail, eliminates opponents contained within 
+    def _update_trails_and_territory(self, killed: set[str]):
+        enclosure_kills: set[str] = set()
+        for agent in self.agents:
+            if agent in killed:
+                continue
+            idx = AGENT_IDX[agent]
+            r, c = self.pos[agent]
+            cell = int(self.grid[r, c])
+
+            if cell == TERRITORY[idx]:
+                # Returned to own territory so close the trail
+                if self.has_trail[agent]:
+                    if self._flood_claim(idx):
+                        enclosure_kills.add(AGENT_IDS[1 - idx])
+                    self.has_trail[agent] = False
+            else:
+                # Outside territory — leave a trail
+                if cell != TRAIL[idx]:
+                    self.grid[r, c] = TRAIL[idx]
+                self.has_trail[agent] = True
+        return enclosure_kills
+
+    def _compute_reward(self,
+        agent: str,
+        prev_terr: dict[str, int],
+        killed: set[str],
+    ):
+        # calculates reward for agent
+        idx = AGENT_IDX[agent]
+        opp = AGENT_IDS[1 - idx]
+        won  = agent not in killed and opp in killed
+        lost = agent in killed
+
+        if self.reward_mode == "sparse":
+            if won:
+                return 1.0
+            if lost:
+                return -1.0
+            return 0.0
+
+        if self.reward_mode == "dense":
+            grid_area = self.grid_size ** 2
+            curr     = int(np.sum(self.grid == TERRITORY[idx]))
+            opp_curr = int(np.sum(self.grid == TERRITORY[1 - idx]))
+            delta     = (curr     - prev_terr[agent]) / grid_area
+            opp_delta = (opp_curr - prev_terr[opp])   / grid_area
+            reward = delta - 0.5 * opp_delta
+            if won:
+                reward += 1.0
+            elif lost:
+                reward -= 1.0
+            return reward
+
+        # "mixed"
+        curr     = int(np.sum(self.grid == TERRITORY[idx]))
+        delta    = curr - prev_terr[agent]  # / grid_area
+        survival = 0.0 if lost else 0.001
+        return delta + survival
     
     def _flood_claim(self, agent_idx: int) -> bool:
-        # when an agent closes loop in trail
-        # determines which cells are captured, and if opponent was killedns True if the opponent's trail was enclosed (opponent dies)
+        # When an agent closes its trail loop, determines which cells are
+        # captured. Returns True if the opponent's trail was enclosed (opponent dies).
         tv  = TERRITORY[agent_idx]
         tr  = TRAIL[agent_idx]
         otr = TRAIL[1 - agent_idx]
@@ -336,11 +366,66 @@ class PaperIOEnv(ParallelEnv):
 
         return opp_eliminated
 
-    def __render__(self):
-        if self.render_mode == None:
+    def render(self):
+    # pygame rendering
+        if self.render_mode is None:
             return None
-        # pygame stuff
+
+        px = self._CELL_PX
+        W = H = self.grid_size * px
+
+        if self._screen is None:
+            pygame.init()
+            if self.render_mode == "human":
+                self._screen = pygame.display.set_mode((W, H))
+                pygame.display.set_caption("Paper.io RL")
+                self._clock = pygame.time.Clock()
+            else:
+                self._screen = pygame.Surface((W, H))
+
+        self._screen.fill((30, 30, 30))
+
+        # Grid cells
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                color = self._PALETTE.get(int(self.grid[r, c]), (210, 210, 210))
+                pygame.draw.rect(
+                    self._screen, color,
+                    (c * px, r * px, px - 1, px - 1),
+                )
+
+        # Agent heads and direction indicator
+        for agent in self.possible_agents:
+            if not self.alive.get(agent, False):
+                continue
+            r, c = self.pos[agent]
+            cx, cy = c * px + px // 2, r * px + px // 2
+            head_color = self._HEAD_COLOR[agent]
+            pygame.draw.circle(self._screen, head_color, (cx, cy), px // 2 - 1)
+            # Small arrow in direction of travel
+            dr, dc = DR[self.direction[agent]]
+            ax, ay = cx + dc * (px // 3), cy + dr * (px // 3)
+            pygame.draw.line(self._screen, (255, 255, 255), (cx, cy), (ax, ay), 2)
+
+        if self.render_mode == "human":
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.close()
+                    return None
+            pygame.display.flip()
+            if self._clock is not None:
+                self._clock.tick(10)
+            return None
+        else:
+            # rgb_array: (H, W, 3)
+            return np.transpose(
+                np.array(pygame.surfarray.pixels3d(self._screen)),
+                axes=(1, 0, 2),
+            )
     
-    def __close__(self):
-        # clsoe pygame
-        return
+    def close(self):
+        # close pygame
+        if self._screen is not None:
+            pygame.quit()
+            self._screen = None
+            self._clock = None
