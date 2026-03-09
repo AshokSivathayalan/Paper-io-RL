@@ -29,7 +29,7 @@ from paperio_env import (
 )
 
 if TYPE_CHECKING:
-    from paper_io_env import PaperIOEnv
+    from paperio_env import PaperIOEnv
 
 
 class GreedyAgent:
