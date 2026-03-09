@@ -429,3 +429,43 @@ class PaperIOEnv(ParallelEnv):
             pygame.quit()
             self._screen = None
             self._clock = None
+
+
+if __name__ == "__main__":
+    import time
+    from greedy_agent import GreedyAgent
+
+    env = PaperIOEnv(
+        grid_size=20,
+        reward_mode="mixed",
+        render_mode="human",
+        max_steps=300,
+    )
+    greedy_agents = [GreedyAgent(aid, env.grid_size) for aid in env.possible_agents]
+
+    total_eps = 3
+    for ep in range(total_eps):
+        obs, info = env.reset(seed=ep)
+        ep_rewards = {a: 0.0 for a in env.possible_agents}
+        steps = 0
+
+        while env.agents:
+            actions = {
+                ga.agent_id: ga.act(env)
+                for ga in greedy_agents
+                if ga.agent_id in env.agents
+            }
+            obs, rew, term, trunc, info = env.step(actions)
+            for a, r in rew.items():
+                ep_rewards[a] += r
+            env.render()
+            steps += 1
+
+        terr = env.territory_counts()
+        print(
+            f"  Episode {ep + 1:>2d} | steps={steps:>4d} | "
+            f"rewards={ep_rewards} | territory={terr}"
+        )
+
+    env.close()
+    print("Done.")
