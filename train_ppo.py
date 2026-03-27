@@ -129,6 +129,8 @@ def moving_avg(x, w=10):
 plt.figure()
 plt.plot(moving_avg(callback.rewards))
 plt.title("Training Reward Curve")
+plt.xlabel("Episode")
+plt.ylabel("Average Reward")
 plt.savefig("reward_curve.png")
 
 
