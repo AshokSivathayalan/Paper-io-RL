@@ -190,7 +190,7 @@ class SelfPlayCallback(BaseCallback):
 
 
 def moving_avg(x, w=10):
-    return np.convolve(x, np.ones(w) / w, mode="valid")
+    return np.convolve(x, np.ones(w)/w, mode="valid")
 
 
 def evaluate(model, episodes: int = 50):
