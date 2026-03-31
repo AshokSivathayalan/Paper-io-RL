@@ -56,6 +56,7 @@ class PaperIOEnv(ParallelEnv):
         reward_mode: str = "mixed",
         render_mode: Optional[str] = None,
         max_steps: int = 1000,
+        terminal_scale: float = 1.0,
     ):
         super().__init__()
         assert reward_mode in ("sparse", "dense", "mixed"), (
@@ -67,11 +68,12 @@ class PaperIOEnv(ParallelEnv):
         self.reward_mode = reward_mode
         self.render_mode = render_mode
         self.max_steps = max_steps
+        self.terminal_scale: float = terminal_scale
 
         self.possible_agents: list[str] = AGENT_IDS[:]
         self.agents: list[str] = []
 
-        _obs_shape = (grid_size, grid_size, 7)
+        _obs_shape = (grid_size, grid_size, 10)
         self.observation_spaces = {
             a: spaces.Box(0.0, 1.0, shape=_obs_shape, dtype=np.float32)
             for a in self.possible_agents
@@ -150,12 +152,14 @@ class PaperIOEnv(ParallelEnv):
         opp = AGENT_IDS[1 - idx]
         G = self.grid_size
 
-        obs = np.zeros((G, G, 7), dtype=np.float32)
+        obs = np.zeros((G, G, 10), dtype=np.float32)
+        # Ch 0-3: territory and trail ownership
         obs[:, :, 0] = (self.grid == TERRITORY[idx]).astype(np.float32)
         obs[:, :, 1] = (self.grid == TERRITORY[1 - idx]).astype(np.float32)
         obs[:, :, 2] = (self.grid == TRAIL[idx]).astype(np.float32)
         obs[:, :, 3] = (self.grid == TRAIL[1 - idx]).astype(np.float32)
 
+        # Ch 4-5: head positions (one-hot)
         r, c = self.pos[agent]
         obs[r, c, 4] = 1.0
 
@@ -163,7 +167,17 @@ class PaperIOEnv(ParallelEnv):
             or_, oc = self.pos[opp]
             obs[or_, oc, 5] = 1.0
 
-        obs[:, :, 6] = self.direction[agent] / 3.0
+        # Ch 6-7: own direction as (dr, dc), scaled to [0, 1]
+        dr, dc = DR[self.direction[agent]]
+        obs[:, :, 6] = (dr + 1) / 2.0   # -1,0,1 → 0.0, 0.5, 1.0
+        obs[:, :, 7] = (dc + 1) / 2.0
+
+        # Ch 8-9: opponent direction as (dr, dc)
+        if self.alive.get(opp, False):
+            odr, odc = DR[self.direction[opp]]
+            obs[:, :, 8] = (odr + 1) / 2.0
+            obs[:, :, 9] = (odc + 1) / 2.0
+
         return obs
 
     def step(self,
@@ -192,16 +206,41 @@ class PaperIOEnv(ParallelEnv):
         self._apply_kills(new_kills, terminations)
         killed |= new_kills
 
-        rewards = {
-            a: self._compute_reward(a, prev_terr, killed)
-            for a in self.agents
-        }
-
         if self.step_count >= self.max_steps:
             for a in self.agents:
                 truncations[a] = True
 
-        _zero_obs = np.zeros((self.grid_size, self.grid_size, 7), dtype=np.float32)
+        # On truncation with no kill, determine winner by territory count
+        territory_winner: Optional[str] = None
+        if any(truncations.values()) and not killed:
+            counts = self.territory_counts()
+            t0, t1 = counts["player_0"], counts["player_1"]
+            if t0 > t1:
+                territory_winner = "player_0"
+            elif t1 > t0:
+                territory_winner = "player_1"
+
+        rewards = {
+            a: self._compute_reward(a, prev_terr, killed, territory_winner)
+            for a in self.agents
+        }
+
+        # Write outcome into info for any agent whose episode is ending
+        for a in self.agents:
+            if terminations[a] or truncations[a]:
+                opp = AGENT_IDS[1 - AGENT_IDX[a]]
+                if a not in killed and opp in killed:
+                    infos[a]["outcome"] = "win"
+                elif a in killed:
+                    infos[a]["outcome"] = "loss"
+                elif territory_winner == a:
+                    infos[a]["outcome"] = "win"
+                elif territory_winner == opp:
+                    infos[a]["outcome"] = "loss"
+                else:
+                    infos[a]["outcome"] = "draw"
+
+        _zero_obs = np.zeros((self.grid_size, self.grid_size, 10), dtype=np.float32)
         observations = {
             a: _zero_obs if (terminations[a] or truncations[a]) else self._obs(a)
             for a in self.agents
@@ -214,11 +253,18 @@ class PaperIOEnv(ParallelEnv):
 
         return observations, rewards, terminations, truncations, infos
 
+    # Opposite direction lookup: attempting a 180° reversal is ignored.
+    _OPPOSITE = {UP: DOWN, DOWN: UP, LEFT: RIGHT, RIGHT: LEFT}
+
     # update directions and move agents
     def _apply_actions(self, actions: dict[str, int]):
         moved: set[str] = set()
         for agent in self.agents:
             action = int(actions.get(agent, self.direction[agent]))
+            # Ignore 180° reversals — the agent would instantly hit its
+            # own trail and die, which is an uninteresting failure mode.
+            if action == self._OPPOSITE[self.direction[agent]]:
+                action = self.direction[agent]
             self.direction[agent] = action
             r, c = self.pos[agent]
             dr, dc = DR[action]
@@ -239,6 +285,12 @@ class PaperIOEnv(ParallelEnv):
                 kills.add(AGENT_IDS[1 - idx])
             elif cell == TRAIL[idx]:       # stepped on own trail
                 kills.add(agent)
+
+        # Head-on collision: both agents moved into the same cell → both die
+        agents = list(moved)
+        if len(agents) == 2 and self.pos[agents[0]] == self.pos[agents[1]]:
+            kills.update(agents)
+
         return kills
 
     # erase killed agent trail, end game if kill occurs
@@ -253,11 +305,13 @@ class PaperIOEnv(ParallelEnv):
                 terminations[a] = True
 
     
-    # close or extend trail, eliminates opponents contained within 
+    # close or extend trail, eliminates opponents contained within
     def _update_trails_and_territory(self, killed: set[str]):
         enclosure_kills: set[str] = set()
-        for agent in self.agents:
-            if agent in killed:
+        agents = list(self.agents)
+        np.random.shuffle(agents)
+        for agent in agents:
+            if agent in killed or agent in enclosure_kills:
                 continue
             idx = AGENT_IDX[agent]
             r, c = self.pos[agent]
@@ -280,39 +334,52 @@ class PaperIOEnv(ParallelEnv):
         agent: str,
         prev_terr: dict[str, int],
         killed: set[str],
+        territory_winner: Optional[str] = None,
     ):
         # calculates reward for agent
         idx = AGENT_IDX[agent]
         opp = AGENT_IDS[1 - idx]
-        won  = agent not in killed and opp in killed
-        lost = agent in killed
+        won  = (agent not in killed and opp in killed) or territory_winner == agent
+        lost = agent in killed or (territory_winner is not None and territory_winner == opp)
 
         if self.reward_mode == "sparse":
             if won:
-                return 1.0
+                return 10.0 * self.terminal_scale
             if lost:
-                return -1.0
+                return -10.0 * self.terminal_scale
             return 0.0
 
         if self.reward_mode == "dense":
             grid_area = self.grid_size ** 2
             curr     = int(np.sum(self.grid == TERRITORY[idx]))
             opp_curr = int(np.sum(self.grid == TERRITORY[1 - idx]))
-            delta     = (curr     - prev_terr[agent]) / grid_area
-            opp_delta = (opp_curr - prev_terr[opp])   / grid_area
+            delta     = (curr     - prev_terr[agent]) / self.grid_size
+            opp_delta = (opp_curr - prev_terr[opp]) / self.grid_size
             reward = delta - 0.5 * opp_delta
             if won:
-                reward += 1.0
+                reward += 10.0 * self.terminal_scale
             elif lost:
-                reward -= 1.0
+                reward -= 10.0 * self.terminal_scale
             return reward
 
         # "mixed"
-        curr     = int(np.sum(self.grid == TERRITORY[idx]))
-        delta    = curr - prev_terr[agent]  # / grid_area
-        survival = 0.0 if lost else 0.001
-        return delta + survival
+        curr  = int(np.sum(self.grid == TERRITORY[idx]))
+        delta = (curr - prev_terr[agent]) / self.grid_size
+        # Penalise any step that doesn't gain territory
+        idle = delta == 0 and not (won or lost)
+        reward = delta * 3.0 + (-0.01 if idle else 0.0)
+        if won:
+            reward += 10.0 * self.terminal_scale
+        elif lost:
+            reward -= 10.0 * self.terminal_scale
+        return reward
     
+    def territory_counts(self) -> dict:
+        return {
+            a: int(np.sum(self.grid == TERRITORY[AGENT_IDX[a]]))
+            for a in self.possible_agents
+        }
+
     def _flood_claim(self, agent_idx: int) -> bool:
         # When an agent closes its trail loop, determines which cells are
         # captured. Returns True if the opponent's trail was enclosed (opponent dies).
