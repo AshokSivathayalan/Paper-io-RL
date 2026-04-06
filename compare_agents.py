@@ -11,6 +11,9 @@ from paperio_env import PaperIOEnv
 from greedy_agent import GreedyAgent
 from random_agent import RandomAgent
 
+# Flip UP↔DOWN and LEFT↔RIGHT to convert an action from a 180°-rotated
+# observation back to real board directions.
+_ACTION_FLIP = {0: 1, 1: 0, 2: 3, 3: 2}
 
 class SB3AgentWrapper:
     def __init__(self, model_path, agent_id, name):
@@ -54,12 +57,31 @@ def get_agent_action(agent, env, obs_dict, agent_id):
     if agent_id not in env.agents:
         return None
 
+    # Greedy and Random agents handle their own internal spatial logic
     if isinstance(agent, (GreedyAgent, RandomAgent)):
         return int(agent.act(env))
 
     obs = obs_dict[agent_id]
-    obs = np.transpose(obs, (2, 0, 1))
-    return int(agent.act(env, obs))
+    
+    # If the neural network is playing as player_1, we must rotate the board 180 
+    # degrees to match the spatial orientation it saw during training as player_0.
+    if agent_id == "player_1":
+        obs = np.rot90(obs, k=2, axes=(0, 1)).copy()
+        
+        # Invert the direction channels (6 through 9)
+        for ch in (6, 7, 8, 9):
+            obs[:, :, ch] = 1.0 - obs[:, :, ch]
+            
+        obs = np.transpose(obs, (2, 0, 1))
+        action = int(agent.act(env, obs))
+        
+        # Flip the action back to the real board's spatial frame
+        return _ACTION_FLIP[action]
+    
+    # Player 0 requires no transformation
+    else:
+        obs = np.transpose(obs, (2, 0, 1))
+        return int(agent.act(env, obs))
 
 
 def run_episode(env, agent_a, agent_b, seed=None, render=False):
@@ -260,10 +282,10 @@ def main():
         "random": lambda agent_id: _make_random(agent_id, args.grid_size),
         "greedy": lambda agent_id: _make_greedy(agent_id, args.grid_size),
         "ppo_vs_greedy": lambda agent_id: SB3AgentWrapper(
-            "ppo_selfplay_model_on_greedy.zip", agent_id, "ppo_vs_greedy"
+            "Models/vs_greedy.zip", agent_id, "ppo_vs_greedy"
         ),
         "ppo_selfplay": lambda agent_id: SB3AgentWrapper(
-            "ppo_selfplay_model_selfplay_8m.zip", agent_id, "ppo_selfplay"
+            "Models/selfplay.zip", agent_id, "ppo_selfplay"
         ),
     }
 

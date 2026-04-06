@@ -1,0 +1,42 @@
+{
+    "random": {
+        "games": 250,
+        "wins": 55,
+        "losses": 188,
+        "draws": 7,
+        "win_rate": 0.22,
+        "avg_reward": -5.267480000000003,
+        "avg_territory": 28.884,
+        "avg_steps_survived": 26.816
+    },
+    "greedy": {
+        "games": 250,
+        "wins": 124,
+        "losses": 125,
+        "draws": 1,
+        "win_rate": 0.496,
+        "avg_reward": 0.022719999999852546,
+        "avg_territory": 66.968,
+        "avg_steps_survived": 642.24
+    },
+    "ppo_vs_greedy": {
+        "games": 250,
+        "wins": 149,
+        "losses": 1,
+        "draws": 100,
+        "win_rate": 0.596,
+        "avg_reward": 14.858919999999902,
+        "avg_territory": 133.064,
+        "avg_steps_survived": 730.892
+    },
+    "ppo_selfplay": {
+        "games": 250,
+        "wins": 67,
+        "losses": 81,
+        "draws": 102,
+        "win_rate": 0.268,
+        "avg_reward": -6.184719999999883,
+        "avg_territory": 35.748,
+        "avg_steps_survived": 717.036
+    }
+}
